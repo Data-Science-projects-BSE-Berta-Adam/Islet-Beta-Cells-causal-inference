@@ -1,0 +1,749 @@
+---
+title: "Islet beta cells project"
+author: "Adam Olivares Canal, Yulia Smolyarova, Berta Canal Simón"
+date: "2024-03-25"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+abstract: |
+  In this project we aim to corroborate the evidence provided in class, where through a causal analysis of gene expression data profiled in beta cells from human pancreatic islets (responsible for secreting insulin), it was found that a transcription factor gene (TF) was helping to increase the transcription of a protein coding gene of interest. Since both of them are regulated by other genes, some of which might affect either or both of them, there are many confounding effects that can mask the actual effect of the TF on the gene of interest. For our analysis, instead of using the same VASA-seq dataset from class, we were provided with 10 i.i.d. samples generated with scRNA sequencing technology, which we used to emulate the aforementioned analysis. The models employed for this project comprised a combination of frequentist and Bayesian approaches to perform inference: MLE, LASSO-BIC, Debiased-LASSO, BMA (normal prior), Double-LASSO (DL), ACPME and CIL (EP + normal). Despite the technological differences in the employed gene sequencing technology between the two datasets, we could observe a similar relationship between the transcription factor gene and the protein coding gene of interest.
+
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE}
+PATH <- '/Users/bertacanal/Desktop/'
+DATDIR <- paste(PATH, 'scrna_small/', sep = '')
+```
+
+```{r, include = FALSE}
+#library(remotes)
+#remotes::install_github("AnderWilson/regimes")
+```
+
+```{r, include = FALSE}
+# Dependences
+library(ivreg)
+library(modelsummary)
+library(mombf)
+library(hdm)
+library(glmnet)
+library(selectiveInference)
+library(DDL)
+library(dplyr)
+#library(regimes)
+library(kableExtra)
+library(ggplot2)
+```
+
+```{r, include = FALSE}
+# Global parameters
+force <- FALSE  # Set to TRUE if you want to run pre-computed methods
+```
+
+```{r, include = FALSE}
+# Load functions
+source(paste(DATDIR, 'functions.R', sep = ''))
+```
+
+## 1. Introduction 
+
+Beta cells are one of four major types of cells present in the islets of Langerhans, a specialized cluster of cells present in the endocrine pancreas of most mammals. These cells synthesize and secrete the hormone insulin mainly in response to glucose, but also in response to other signals, including several nutrients, hormones and nervous stimuli. The process of insulin secretion, being such an essential process for homeostasis, is part of a complex signaling cascade. Thus, it is affected by the co-regulation of hundreds of genes and other genomic regulatory elements, which must act coordinately for the correct functioning of beta cells. 
+
+In this project, we attempt to continue to corroborate the evidence shown in class, where the transcription factor gene, named $d$ in our dataset, helps increase the transcription of our protein coding gene of interest, denoted as $y$. The regulation of these two genes is essential in the beta cell regulation process. Therefore, we aim to use the provided gene expression data to see if we observe the same causal effect of $d$ on $y$. Since both $y$ and $d$ are affected by other genes, some of which might affect either or both of them, there are many confounding effects that can mask the actual effect of $d$ on $y$. 
+
+Our dataset differs from the one used in class in the sequencing technique. While the data of the analysis seen in class were collected using a new technique called VASA-seq, the dataset used in this analysis employs data obtained through single-cell RNA-seq, a more standard technique. Despite technological differences, both techniques measure the same metric on beta cells from donor pancreatic islets, but the scRNA-seq data is split in 10 different i.i.d. samples. Both datasets are structured as matrices with cells as rows and normalized and standardized counts of genes as columns.
+
+To emulate this causal analysis on our dataset and observe if the previous findings can be confirmed here, we used the following models to do inference on $d$ under specifications with confounding variables: MLE, LASSO-BIC, Double-LASSO (DL), Debiased-LASSO, BMA (normal prior) and CIL (EP + normal prior). To this end, we will present and discuss our results obtained in the next section, where we also compare our results with those exposed during the lectures.
+
+
+## 2. Results
+
+The scRNA-seq data is first explored using the 10 different i.i.d. samples and then they are all integrated into a single dataset to infer and extract conclusions on the relationship between $d$ and $y$.
+
+
+### 2.1. Samples from scRNA-seq data
+
+Firstly, a preprocessing is required for further analysis using the scRNA-seq samples:
+
+```{r, results = 'hide'}
+# Load data and generate datasets
+scrna <- list()
+datasets <- list()
+
+for (i in 1:10) {
+  file_name <- sprintf('data/scrna_small_s%02d.rds', i)
+  fin <- paste(DATDIR, file_name, sep = '')
+  scrna_small <- readRDS(file = fin)
+  cat('Read file:', fin, '\n')
+
+  scrna[[sprintf("scrna_%02d", i)]] <- scrna_small
+
+  y <- matrix(scrna_small[, 'y'], ncol = 1)
+  D <- matrix(scrna_small[, 'd'], ncol = 1)
+  X <- as.matrix(scrna_small[, -c(1, 2)])
+  Z <- cbind(D, X)
+  colnames(Z)[1] <- 'd'
+  
+  datasets[[sprintf("scrna_%02d", i)]] <- list(y = y, D = D, X = X, Z = Z)
+  
+  rm(file_name, fin, scrna_small, y, D, X, Z)
+  }
+```
+
+```{r, include = FALSE}
+dim(scrna$scrna_01)
+```
+
+The samples contain the count of 1418 transcribed genes across 1436 cells. Note that counts are not integers because they are normalized and log transformed. Below it is shown an example of the first sample: 
+
+```{r, echo = FALSE}
+scrna$scrna_01[1:5, 1:6]
+```
+
+As aforementioned, the methods used corresponds to: MLE, LASSO-BIC,  Debiased-LASSO, BMA (normal prior), Double-LASSO (DL) and CIL (EP + normal). Note that ACPME has been disregarded due to technical reasons.
+
+#### MLE
+
+The dimensions from X in each sample corresponds to 1416 transcribed gens across 1436 cells, excluding the transcription factor gene $d$ and the gene of interest $y$. Therefore, MLE can be applied since the number of cells (rows) is higher than the number of genes (columns). 
+
+```{r, include = FALSE}
+# Ouput matrix for MLE
+result_mle <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+```{r, results = 'hide'}
+for (i in 1:10) {
+  fout <- paste(DATDIR, sprintf("mle/result_mle_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    scrna_small <- scrna[[sprintf("scrna_%02d", i)]]
+    X <- datasets[[sprintf("scrna_%02d", i)]][["X"]]
+  
+    if (nrow(X) > ncol(X)) {  
+      f <- formula(paste('y ~ ', paste(names(scrna_small)[-1], collapse = ' + ')))
+      mle <- lm(f, data = scrna_small)
+      b.mle <- summary(mle)[['coefficients']]
+      b.mle <- cbind(b.mle[, 1], confint(mle), b.mle[, 4])
+      colnames(b.mle)[1] <- 'Estimate'
+      colnames(b.mle)[4] <- 'p-value'
+    
+      # Add to output
+      result_mle[i, ] <- b.mle['d', ]
+      rownames(result_mle)[nrow(result_mle)] <- sprintf("scrna_%02d", i)
+      
+      saveRDS(result_mle, file = fout); cat('Saved file:', fout, '\n')
+    }
+  } else {
+    result_mle <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+#### LASSO-BIC
+
+The regularization parameter $\mathbf{\lambda}$ is set to the value minimizing the BIC, whose criteria is model selection consistent. Note that confidence intervals cannot be built around LASSO estimates.
+
+```{r, include = FALSE}
+# Ouput matrix for LASSO + BIC
+result_lasso_bic <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+```{r, results = 'hide'}
+for (i in 1:10) {
+  fout <- paste(DATDIR, sprintf("lasso_bic/result_lasso_bic_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    y <- datasets[[sprintf("scrna_%02d", i)]][["y"]]
+    Z <- datasets[[sprintf("scrna_%02d", i)]][["Z"]]
+
+    lasso.fit <- lasso.bic(y, Z)
+
+    # Add to output
+    result_lasso_bic[i, ] <- c(lasso.fit[['coef']]['d'], NA, NA, NA)
+    rownames(result_lasso_bic)[nrow(result_lasso_bic)] <- sprintf("scrna_%02d", i)
+    
+    saveRDS(result_lasso_bic, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+    result_lasso_bic <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+#### Debiased-LASSO
+
+```{r, include = FALSE}
+# Ouput matrix for Debiased LASSO
+result_deblasso <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+In the DDL function, `index` is set to 1 to specify the regression coefficient of interest, in our case the transcription factor gene $d$.
+
+```{r, results = 'hide'}
+for (i in 1:10){
+  fout <- paste(DATDIR, sprintf("deblasso/result_deblasso_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    y <- datasets[[sprintf("scrna_%02d", i)]][["y"]]
+    Z <- datasets[[sprintf("scrna_%02d", i)]][["Z"]]
+  
+    debl <- DDL::DDL(X = Z, Y = y[, 1], index = 1)
+    
+    # Obtain relevant statistics
+    sum.dl <- summary(debl)
+    dl.est <- sum.dl[['output.est']][['est_ddl']]
+    dl.low <- dl.est + qnorm(0.025) * sum.dl[['output.est']][['Std. Error']]
+    dl.upp <- dl.est + qnorm(0.975) * sum.dl[['output.est']][['Std. Error']]
+    dl.pvl <- sum.dl[['output.est']][['Pr(>|z|)']]
+
+    # Add to output
+    result_deblasso[i, ] <- c(dl.est, dl.low, dl.upp, dl.pvl)
+    rownames(result_deblasso)[nrow(result_deblasso)] <- sprintf("scrna_%02d", i)
+    
+    saveRDS(result_deblasso, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+  result_deblasso <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+}
+```
+
+#### Double-LASSO (DL)
+
+```{r, include = FALSE}
+# Ouput matrix for Double LASSO
+result_double_lasso <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+```{r, results = 'hide'}
+for (i in 1:10) {
+  fout <- paste(DATDIR, sprintf("double_lasso/result_double_lasso_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    y <- datasets[[sprintf("scrna_%02d", i)]][["y"]]
+    X <- datasets[[sprintf("scrna_%02d", i)]][["X"]]
+    D <- datasets[[sprintf("scrna_%02d", i)]][["D"]]
+  
+    dl <- hdm::rlassoEffect(x = X, y = y, d = D, method = 'double selection')
+  
+    # Add to output
+    result_double_lasso[i, ] <- c(summary(dl)[[1]][1], confint(dl), summary(dl)[[1]][4])
+    rownames(result_double_lasso)[nrow(result_double_lasso)] <- sprintf("scrna_%02d", i)
+
+    saveRDS(result_double_lasso, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+    result_double_lasso <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+#### BMA (normal prior)
+
+```{r, include = FALSE}
+# Ouput matrix for BMA (normal prior)
+result_bma_normal <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+```{r, results = 'hide'}
+for (i in 1:10) {
+  fout <- paste(DATDIR, sprintf("bma_normal/result_bma_normal_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    scrna_small <- scrna[[sprintf("scrna_%02d", i)]]
+    f <- formula(paste('y ~ ', paste(names(scrna_small)[-1], collapse = ' + ')))
+    ms1 <- mombf::modelSelection(f, data = scrna_small, niter = 1e4,
+      priorCoef = normalidprior(), priorDelta = modelbbprior(1, 1))
+    b.bma1 <- coef(ms1)
+
+    # Add to output
+    result_bma_normal[i, ] <- b.bma1['d', ]
+    rownames(result_bma_normal)[nrow(result_bma_normal)] <- sprintf("scrna_%02d", i)
+    
+    save(result_bma_normal, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+    result_bma_normal <- get(load(file = fout)); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+#### ACPME
+
+As mentioned, we could not successfully run the ACPME model, not even with a single sample, because each time we were either running out of memory or our R session aborted unexpectedly, thus disregarding it from the analysis.
+
+```{r, include = FALSE}
+# Ouput matrix for ACPME
+result_acpme <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+
+```{r, eval = FALSE}
+fout <- paste(PATH, sprintf("acpme/result_acpme_scrna_1.RData"), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    y <- results[["scrna_01"]][["y"]]
+    D <- results[["scrna_01"]][["D"]]
+    X <- results[["scrna_01"]][["X"]]
+    
+    acm.fit_scrna1 <- regimes::acpme(y = y, Z = D, C = X[, -1], niter = 1e4)
+    saveRDS(acm.fit_scrna1, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+    acm.fit_scrna1 <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+#### CIL (EP + normal)
+
+```{r, include = FALSE}
+# Ouput matrix for CIL (EP + normal)
+result_cil_normal <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA)
+```
+
+```{r, results = 'hide'}
+for (i in 1:10){
+  fout <- paste(DATDIR, sprintf("cil_normal/result_cil_normal_scrna_%02d.rds", i), sep = '')
+  if (! file.exists(fout) | force == TRUE) {
+    y <- datasets[[sprintf("scrna_%02d", i)]][["y"]]
+    X <- datasets[[sprintf("scrna_%02d", i)]][["X"]]
+    D <- datasets[[sprintf("scrna_%02d", i)]][["D"]]
+    
+    cilfit <- mombf::cil(y = y, D = D, X = X, R = 1e4,
+      th.search = 'EP', priorCoef = normalidprior())
+    b.cil <- coef(cilfit[['msfit']])
+    
+    # Add to output
+    result_cil_normal[i,] <- b.cil[2,]
+    rownames(result_cil_normal)[nrow(result_cil_normal)] <- sprintf("scrna_%02d", i)
+
+    saveRDS(result_cil_normal, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+    result_cil_normal <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  }; rm(fout)
+}
+```
+
+```{r, include = FALSE}
+all_estimates <- bind_rows(
+  data_frame(Method = 'mle', Estimate = result_mle$estimate),
+  data_frame(Method = 'lasso_bic', Estimate = result_lasso_bic$estimate),
+  data_frame(Method = 'deb_lasso', Estimate = result_deblasso$estimate),
+  data_frame(Method = 'double_lasso', Estimate = result_double_lasso$estimate),
+  data_frame(Method = 'bma_normal', Estimate = result_bma_normal$estimate),
+  data_frame(Method = 'cil_normal', Estimate = result_cil_normal$estimate)
+)
+
+all_estimates$Method <- factor(all_estimates$Method, levels = c('mle', 'lasso_bic', 'deb_lasso', 'double_lasso', 'bma_normal', 'cil_normal'))
+```
+
+We start by generating a figure containing boxplots for the point estimates (for each of the 10 samples) for each version of the following methods MLE, LASSO-BIC, DL, Debiased-LASSO, BMA and CIL. ACPME code can still be found in the .rmd file, but we could not successfully run the model because each time we were either running out of memory or our R session aborted unexpectedly. 
+
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+
+```{r fig.height=5, fig.width=8, echo=FALSE, fig.align='center', out.width='600px', fig.cap='Figure 1: Sample treatment effect estimates from scRNA-seq data.'}
+ggplot(all_estimates, aes(x = Method, y = Estimate)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = NULL,
+       y = "Treatment effect estimate") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(t = 10, r = 10, b = 20, l = 10, unit = "pt"))
+```
+
+<figure style="text-align: center;">
+  <img src="/Users/bertacanal/Desktop/scrna_small/VASA_seq_data_results/treatment_effect_cis.png" style="width: 600px; height: auto; margin-bottom: 20px;">
+  <figcaption style="text-align: left; margin-left: 160px;">Figure 2: VASA-seq data results.</figcaption>
+</figure>
+</div>
+
+As we can see in figures 1 and 2, despite the technological differences of the generated data, the sampling distributions of the point estimates for each model across samples (scRNA-seq data) resembles the confidence/credible intervals (denoted as CI hereinafter) seen in class (VASA-seq data). If we go more into detail, with regard to the sample treatment effect estimates from scRNA data, the middle half of our estimate sampling distribution (comprised of those estimates contained in the IQR) is included in the CI of the treatment effect estimates from VASA-seq data results only for the methods corresponding to MLE, DL and BMA. In fact, the sample estimates from the last two mentioned methods are entirely included in the CI. Instead, for the MLE, two sample estimates are smaller than the lower bound from the CI, thus not being included (the minimum sample estimate from scRNA-seq corresponds to -0.138 but the lower bound of the CI from the VASA-seq data results is -0.066). With respect to Debiased-LASSO, although not all estimates from the middle half of the distribution being included in the CI, so does the median. Instead, in the case of CIL, the median is neither included.
+
+In the case of MLE and BMA, both the middle half of the distribution and the CI includes the 0 estimate. Instead, for Debiased-LASSO and CIL neither of them includes it. As for DL, the CI includes it, while the estimates within the second and third quartiles does not.
+
+Note that regarding LASSO-BIC, whose method does not produce CI, it can be stated that all coefficient are shrunk to 0 in all samples, therefore differing from the positive treatment effect estimated obtained in the VASA-seq data results (which corresponds to 0.039).
+
+```{r, include = FALSE}
+summary_estimates <- all_estimates %>%
+  group_by(Method) %>%
+  summarise(
+    'Median estimate' = round(median(Estimate, na.rm = TRUE), 3),
+    'First quartile' = round(quantile(Estimate, probs = 0.25, na.rm = TRUE), 3),
+    'Third quartile' = round(quantile(Estimate, probs = 0.75, na.rm = TRUE), 3)
+  ) %>%
+  ungroup()
+
+summary_estimates <- as.data.frame(summary_estimates)
+row.names(summary_estimates) <- summary_estimates$Method
+
+summary_estimates$Method <- NULL
+```
+
+The specific data from which the previous figures were generated are summarized in the following tables:
+
+<div style="display: flex; justify-content: space-around; align-items: center; margin-bottom: 20px;">
+<figure style='text-align: center;'>
+
+```{r, echo = FALSE}
+kbl(summary_estimates,align=c(rep('c',times=7))) %>%
+  kable_classic() %>%
+  column_spec(1,width = "6em") %>%
+  kable_paper(full_width = FALSE)
+```
+
+
+<figcaption>Table 1: Summary estimates from scRNA-seq data results</figcaption>
+</figure>
+
+```{r, include = FALSE}
+res_vasa <- readRDS("/Users/bertacanal/Desktop/scrna_small/VASA_seq_data_results/res_vasa.rds")
+```
+
+<figure style='text-align: center;'>
+
+```{r, echo = FALSE}
+kbl(res_vasa,align=c(rep('c',times=7))) %>%
+  kable_classic() %>%
+  column_spec(1,width = "6em") %>%
+  kable_paper(full_width = FALSE)
+```
+
+<figcaption>Table 2: VASA-seq data results</figcaption>
+</figure>
+</div>
+
+### 2.2. Integrated dataset from scRNA-seq data
+
+The integrated dataset includes all 10 samples, therefore its dimensions corresponds to 14360 cells and 1418 genes. Note that the number of cells (rows) tenfold increases, thus being much higher than the number of gens (columns).
+
+```{r, echo=FALSE}
+# Create the integrated dataset
+integrated_scrna <- bind_rows(scrna, .id = NULL)
+```
+
+```{r}
+# Generate datasets
+y <- matrix(integrated_scrna[, 'y'], ncol = 1)
+D <- matrix(integrated_scrna[, 'd'], ncol = 1)
+X <- as.matrix(integrated_scrna[, -c(1, 2)])
+Z <- cbind(D, X)
+colnames(Z)[1] <- 'd'
+```
+
+```{r, include = FALSE}
+# Ouput matrix
+res <- data.frame(
+  estimate = NA,
+  low_int = NA,
+  upp_int = NA,
+  pval_or_pip = NA,
+  model_size = NA)
+```
+
+
+#### MLE
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'mle_integrated/result_mle_integrated.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  if (nrow(X) > ncol(X)) {  
+    f <- formula(paste('y ~ ', paste(names(integrated_scrna)[-1], collapse = ' + ')))
+    mle <- lm(f, data = integrated_scrna)
+    b.mle <- summary(mle)[['coefficients']]
+    b.mle <- cbind(b.mle[, 1], confint(mle), b.mle[, 4])
+    colnames(b.mle)[1] <- 'Estimate'
+    colnames(b.mle)[4] <- 'p-value'
+
+    model_size <- nrow(b.mle[-1,]) - sum(b.mle[-1, 2] < 0 & b.mle[-1, 3] > 0)
+    result_mle_integrated <- c(b.mle['d', ], model_size)
+    
+    saveRDS(result_mle_integrated, file = fout); cat('Saved file:', fout, '\n')
+    }
+  } else {
+    result_mle_integrated <- readRDS(file = fout); cat('Read file:', fout, '\n')
+    
+    # Add to output
+    res[1, ] <- result_mle_integrated
+    rownames(res)[nrow(res)] <- 'mle'
+  }; rm(fout)
+```
+
+#### LASSO-BIC
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'lasso_bic_integrated/result_lasso_bic_integrated.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  lasso.fit <- lasso.bic(y, Z)
+
+  model_size <- sum(lasso.fit$coef[-1]!=0)
+  result_lasso_bic_integrated <- c(lasso.fit[['coef']]['d'], NA, NA, NA, model_size)
+  
+  saveRDS(result_lasso_bic_integrated, file = fout); cat('Saved file:', fout, '\n')
+  } else {
+  result_lasso_bic_integrated <- readRDS(file = fout); cat('Read file:', fout, '\n')
+  
+  # Add to output
+  res <- rbind.data.frame(res, result_lasso_bic_integrated)
+  rownames(res)[nrow(res)] <- 'lasso_bic'
+  
+  }; rm(fout)  
+```
+
+#### Debiased-LASSO 
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'deblasso_integrated/result_deblasso_integrated.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  debl <- DDL::DDL(X = Z, Y = y[, 1], index = 1)
+
+  saveRDS(debl, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  debl <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+```
+
+```{r}
+# Obtain relevant statistics
+sum.dl <- summary(debl)
+dl.est <- sum.dl[['output.est']][['est_ddl']]
+dl.low <- dl.est + qnorm(0.025) * sum.dl[['output.est']][['Std. Error']]
+dl.upp <- dl.est + qnorm(0.975) * sum.dl[['output.est']][['Std. Error']]
+dl.pvl <- sum.dl[['output.est']][['Pr(>|z|)']]
+```
+
+To compute the model size, a proper approach could be to infer on all the regression coefficients using the `DDL` function (instead of only inferring on $d$ by setting `index=1`. However, this approach has been disregarded since it is so computationally expensive. Instead, the `debiased.lasso` function is used selecting those parameters whose confidence interval doesn't include 0 as a proxy of the model size. 
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'deblasso_integrated1/result_deblasso_integrated1.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  debl1 <- debiased.lasso(y, Z, lambda = 'lambda.1se', s = 1, nf = 5)
+  
+  saveRDS(debl1, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  debl1 <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+```
+
+```{r}
+# Add to output
+model_size_deblasso <- nrow(debl1[["coefs"]]) - sum(debl1[["coefs"]][, 2] < 0 & debl1[["coefs"]][, 3] > 0)
+res <- rbind.data.frame(res, c(dl.est, dl.low, dl.upp, dl.pvl, model_size_deblasso))
+rownames(res)[nrow(res)] <- 'deb_lasso'
+```
+
+
+#### Double-LASSO (DL)
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'double_lasso_integrated/result_double_lasso_integrated.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  dl <- hdm::rlassoEffect(x = X, y = y, d = D, method = 'double selection')
+  
+  saveRDS(dl, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  dl <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+
+# Add to output
+model_size_double_lasso <- length(dl[["coefficients.reg"]][-1])
+res <- rbind.data.frame(res, c(summary(dl)[[1]][1], confint(dl), summary(dl)[[1]][4], model_size_double_lasso))
+rownames(res)[nrow(res)] <- 'double_lasso'
+```
+
+
+#### BMA (normal prior)
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'bma_normal_integrated/result_bma_normal_integrated.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  f <- formula(paste('y ~ ', paste(names(integrated_scrna)[-1], collapse = ' + ')))
+  ms1 <- mombf::modelSelection(f, data = integrated_scrna, niter = 1e4,
+    priorCoef = normalidprior(), priorDelta = modelbbprior(1, 1))
+  b.bma1 <- coef(ms1)
+
+  postProb <- mombf::postProb(ms1)
+  postProb[[1]] <- lapply(strsplit(postProb[[1]], ","), function(x) as.numeric(x))
+  model_size <- round(sum(sapply(postProb$modelid, length) * postProb$pp),0)
+  result_bma_normal <- c(b.bma1['d', ], model_size)
+  
+  save(result_bma_normal, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  result_bma_normal <- get(load(file = fout)); cat('Read file:', fout, '\n')
+}; rm(fout)
+
+# Add to output
+res <- rbind.data.frame(res, result_bma_normal)
+rownames(res)[nrow(res)] <- 'bma_normal'
+```
+
+
+#### ACPME
+
+```{r, eval = FALSE}
+fout <- paste(DATDIR, 'acpme_integrated/result_acpme_integrated.RData', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  acm.fit <- regimes::acpme(y = y, Z = D, C = X[, -1], niter = 1e4)
+
+  saveRDS(acm.fit, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  acm.fit <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+
+# Result summary
+colMeans(acm.fit[['beta']])
+t(apply(acm.fit[['beta']], 2, quantile, probs = c(0.025, 0.975)))
+#mean(rowSums(acm.fit[['alpha']]))
+
+# Add to output
+NULL
+```
+
+
+#### CIL (EP + normal)
+
+```{r, results = 'hide'}
+fout <- paste(DATDIR, 'cil_normal_integrated/result_cil.rds', sep = '')
+if (! file.exists(fout) | force == TRUE) {
+  cilfit <- mombf::cil(y = y, D = D, X = X, R = 1e4,
+    th.search = 'EP', priorCoef = normalidprior())
+  b.cil <- coef(cilfit[['msfit']])
+
+  postProb_cil <- mombf::postProb(cilfit)
+  postProb_cil[[1]] <- lapply(strsplit(postProb_cil[[1]], ","), function(x) as.numeric(x))
+  model_size <- round(sum(sapply(postProb_cil$modelid, length)*postProb_cil$pp),0)
+  result_cil <- c(b.cil[2, ], model_size)
+    
+  saveRDS(result_cil, file = fout); cat('Saved file:', fout, '\n')
+} else {
+  result_cil <- readRDS(file = fout); cat('Read file:', fout, '\n')
+}; rm(fout)
+
+# Add to output
+res <- rbind.data.frame(res, result_cil)
+rownames(res)[nrow(res)] <- 'cil_normal'
+```
+
+
+```{r, include = FALSE}
+# Code to create the table
+res2 <- res
+res2$p_value <- ifelse(!rownames(res2) %in% c('cil_normal', 'bma_normal', 'lasso_bic'), format(round(res2$pval_or_pip, 3), nsmall=3), "—")
+res2$p_alpha_given_y <- ifelse(rownames(res2) %in% c('cil_normal', 'bma_normal'), format(round(res2$pval_or_pip, 3), nsmall=3), "—")
+res2$interval <- ifelse(
+  !is.na(res2$low_int) & !is.na(res2$upp_int), 
+  paste("[", sprintf("%.3f", res2$low_int), ", ", sprintf("%.3f", res2$upp_int), "]", sep=""),
+  "—"
+)
+res2$pval_or_pip <- NULL
+res2$low_int <- NULL
+res2$upp_int <- NULL
+```
+
+```{r, include = FALSE}
+res2 <- res2[, c(1, 5, 3, 4, 2)]
+res2 <- res2 %>% 
+  mutate(estimate = sprintf("%.3f", estimate))
+res2[is.na(res2)] <- "—"
+colnames(res2) <- c("Estimate", "95% interval", "p-value", "P(α≠0|y)", "Sample size")
+```
+
+As we can see in table 3, the number of covariates selected across our set of models differs, implying that some of the employed methods may have incurred in under or over selection problems. To disentangle this, we discuss the cases where we suspect the model could under or over selecting covariates.
+
+<figure style='text-align: center;'>
+
+```{r, echo = FALSE}
+kbl(res2,align=c(rep('c',times=7))) %>%
+  kable_classic() %>%
+  column_spec(1,width = "6em") %>%
+  kable_paper(full_width = FALSE)
+```
+
+<figcaption style="margin-bottom: 20px;">Table 3: Summary estimates from scRNA-seq data results</figcaption>
+</figure>
+
+Debiassed-LASSO could be a case where over-selection is taking place. The reason to suspect would be that, although the point estimate, p-value and CI of $d$ are very similar to those in MLE, the model size of this technique is much higher than the proxy used to estimate the size of MLE or those of other techniques that also found a signal (e.g., DL).
+
+BMA with normal prior could be under-selecting and missing relevant covariates. To support our statement, we have for example CIL, with a similar size, finding a relationship between $d$ and $y$ (0.781 probability of inclusion in CIL vs 0.07 in BMA) or other models with more significant covariates selected like DL and MLE (with 95 and 128 respectively), where the p-value of $d$ indicates its regression coefficient is statistically significant. An extension to this framework of BMA is CIL, which is meant to balance over and under-selection using flexible priors and then use BMA for inference, which makes it suitable for settings with multiple treatment effect inference under many potential confounders.
+
+The case of LASSO-BIC is more unclear. Despite no relationship between treatment and outcome being found, there are models with higher and lower size that found $d$ to have a significant point estimate. The fact that $\lambda$ set via BIC leads to a model selection consistency properties (as opposed to LASSO-CV) but it regularizes $d$ to 0, maybe suggests that the number of observed cells is not enough.
+
+If confounders are strongly associated with the treatments, standard methods may fail to include said confounders (or even treatments), resulting in significant omitted variable bias (OVB) due to under-selection. This bias leads to an over or under estimation of our point estimates. By including covariates associated to the treatment $d$, one ameliorates this.
+
+On the other hand, one may force/encourage inclusion of covariates that truly don’t affect $y$. That is, treatment effects remain identifiable, but it leads to a problematic variance inflation because of over-selection, which in turn leads to a much larger standard error and therefore, larger confidence intervals.
+
+These model sizes were computed differently depending on the model considered, that is: For MLE we used the number of variables whose CI does not contain zero as a proxy, as this model isn't able to perform model selection per se. As for penalized likelihood models, LASSO-BIC count the number of covariates not regularized to 0 and DL does the same but for the union of the two steps. In the case of Debiased-LASSO, however, we counted the number of variables whose CI did not include 0. On the other hand, for Bayesian methods like BMA and CIL we did a weighted average, where we multiply the size of each model by its posterior probability as weight.
+
+## 3. Discussion
+
+On a final note, we would like to discuss the evidence across models with our scRNA-seq data. Additionally, we compare the evidence from the two dataset (integrated samples of scRNA-seq data and VASA-seq data) to shed some light on the relationship between $d$ and $y$.
+
+The differences in the nominal magnitude of point estimates of $d$ between data obtained through scRNA-seq and VASA-seq may stem from the fact the new technique (VASA-seq) may be producing more precise results, or because one of the two techniques is under or over estimating gene counts and this could be changing correlations between variables. Nevertheless, this effect is expected to be general for all covariates, thus expecting results with similar relevant factors. In fact, despite the said differences, the sign of the effect of $d$ upon $y$ is mostly positive regardless of the technique used to collect the data.
+
+
+<div style="display: flex; justify-content: space-between; align-items: center;">
+
+<figure>
+
+```{r, fig.height=5, fig.width=8, echo=FALSE, fig.align='center', out.width='600px'}
+# Re-arrange
+res <- res[nrow(res):1, ]
+ylabs <- paste(rownames(res), '\n(',
+  round(res[, 'pval_or_pip'], 3), ')', sep = '')
+
+# Framework
+par(mfrow = c(1, 1), mar = c(4, 6.5, 4, 0.5))
+plot(NA, xlim = range(res[, 1:3], na.rm = TRUE), ylim = c(1, nrow(res)),
+  xlab = 'Treatment effect estimate', ylab = '', yaxt = 'n')
+axis(2, at = 1:nrow(res), ylabs, cex = 0.5, las = 2)
+abline(v = 0, lty = 2)
+abline(v = res[nrow(res), 'estimate'], lty = 3, col = 'gray')
+
+# Dots and CIs
+for (i in 1:nrow(res)) {
+  segments(x0 = res[i, 'low_int'], x1 = res[i, 'upp_int'],
+    y0 = i, y1 = i, col = 'darkred', lwd = 1.5)
+}
+points(res[, 'estimate'], 1:nrow(res), pch = 16, cex = 1.5)
+```
+  <figcaption style="text-align: left; margin-left: 160px; margin-top: 20px;">Figure 3: scRNA-seq data results.</figcaption>
+</figure>
+
+<figure>
+  <img src="/Users/bertacanal/Desktop/scrna_small/VASA_seq_data_results/treatment_effect_cis.png" style="width: 600px; height: auto; margin-bottom: 20px;">
+  <figcaption style="text-align: left; margin-left: 160px; margin-bottom: 20px;">Figure 4: VASA-seq data results.</figcaption>
+</figure>
+</div>
+
+MLE and Debiased-LASSO found a statistically significant (p-value 0.024 < 0.05) positive signal of treatment $d$ on $y$. Regarding DL, it also suggests a statistically significant positive effect of $d$ on $y$ presenting an estimate higher than the previous methods, but with a greater uncertainty. Conversely, since LASSO-BIC cannot be used to infer, we can only state that this method does not seem to select $d$ as a relevant predictor of $y$.
+
+Given the aforementioned suspicion that BMA can be under-selecting covariates, CIL is considered a proper alternative to focus the discussion on. The value of the posterior probability of inclusion of CIL suggests that $d$ is a relevant predictor across all possible models. Based on the credible interval, there is a 95$\%$ probability that the true estimates lies within the [0.000, 0.027] interval. Therefore, even though CIL estimate suggests a positive effect of $d$ and $y$, the credible interval does not exclude the possibility of a null effect.
+
+Overall, we can draw a similar conclusion to that presented in class, i.e., inference on our trained models continue to support the evidence that the transcription factor denoted as $d$ has a positive causal effect on the protein coding gene of interest $y$. 
+
+As a proposed improvement for the project, instead of using normal priors for CIL and BMA, non-local priors could be explored to perform inference. The rationale would be that non-local priors improve the rates at which one discards the truly zero parameters, which have already been employed in the class analysis (that is, with the VASA-seq data).
+
+Furthermore, the limitations of the present project provide avenues for future research. A further analysis could be focused on analyzing the behavior of the different methods subject to the correlations between the variables in both datasets (generated through different sequencing techniques), which may lead to different inference results for some methods.
